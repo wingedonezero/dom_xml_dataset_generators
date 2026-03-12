@@ -42,6 +42,7 @@ DEFAULTS = {
     "nsp_exclude_tik":       False,
     "nsp_exclude_comment":   False,
     "nsp_cdate_as_ddate":    False,
+    "nsp_keep_folders":      False,
     "nsp_dump_date":         "",
     "nsp_release_date":      "",
     "galaxy_csvdir":         "",
@@ -582,6 +583,8 @@ class NspTab(ScrollableFrame):
         self.excl_comment.pack(anchor="w", padx=20, pady=2)
         self.cdate_ddate  = CheckRow(p, "Use NSP file date as dump date", "  --nsp-cdate-as-ddate")
         self.cdate_ddate.pack(anchor="w", padx=20, pady=2)
+        self.keep_folders = CheckRow(p, "Keep extracted folders", "  --keep-folders")
+        self.keep_folders.pack(anchor="w", padx=20, pady=2)
 
         bf = make_frame(p)
         bf.pack(anchor="w", padx=20, pady=16)
@@ -596,6 +599,7 @@ class NspTab(ScrollableFrame):
         self.excl_tik.set(self.cfg.get("nsp_exclude_tik", False))
         self.excl_comment.set(self.cfg.get("nsp_exclude_comment", False))
         self.cdate_ddate.set(self.cfg.get("nsp_cdate_as_ddate", False))
+        self.keep_folders.set(self.cfg.get("nsp_keep_folders", False))
         self.dump_date.set(self.cfg.get("nsp_dump_date", ""))
         self.release_date.set(self.cfg.get("nsp_release_date", ""))
 
@@ -630,6 +634,8 @@ class NspTab(ScrollableFrame):
         if self.excl_tik.get():     cmd.append("--exclude-tik")
         if self.excl_comment.get(): cmd.append("--exclude-comment")
         if self.cdate_ddate.get():  cmd.append("--nsp-cdate-as-ddate")
+        if self.keep_folders.get():
+            cmd.append("--keep-folders")
         return cmd
 
     def _preview(self):
@@ -646,6 +652,7 @@ class NspTab(ScrollableFrame):
         self.cfg["nsp_exclude_tik"]     = self.excl_tik.get()
         self.cfg["nsp_exclude_comment"] = self.excl_comment.get()
         self.cfg["nsp_cdate_as_ddate"]  = self.cdate_ddate.get()
+        self.cfg["nsp_keep_folders"]    = self.keep_folders.get()
         self.cfg["nsp_dump_date"]       = self.dump_date.get()
         self.cfg["nsp_release_date"]    = self.release_date.get()
         save_config(self.cfg)
@@ -1325,6 +1332,7 @@ class App(tk.Tk):
         self.cfg["nsp_exclude_tik"]     = self.nsp_tab.excl_tik.get()
         self.cfg["nsp_exclude_comment"] = self.nsp_tab.excl_comment.get()
         self.cfg["nsp_cdate_as_ddate"]  = self.nsp_tab.cdate_ddate.get()
+        self.cfg["nsp_keep_folders"]    = self.nsp_tab.keep_folders.get()
         self.cfg["nsp_dump_date"]       = self.nsp_tab.dump_date.get()
         self.cfg["nsp_release_date"]    = self.nsp_tab.release_date.get()
         # Galaxy tab
