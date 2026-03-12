@@ -3,7 +3,7 @@
 """
  * cdn2nsp.py
  *
- * Copyright (c) 2023, DarkMatterCore <pabloacurielz@gmail.com>.
+ * Copyright (c) 2023 - 2024, DarkMatterCore <pabloacurielz@gmail.com>.
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -20,15 +20,17 @@
 
 from __future__ import annotations
 
-import os, sys, re, subprocess, shutil, hashlib, random, string, glob, threading, psutil, time, argparse, io, struct, traceback
+import os, sys, re, subprocess, shutil, hashlib, random, string, glob, threading, psutil, time, argparse, io, struct, traceback, rsa, pathlib
 
-from io import BytesIO
 from dataclasses import dataclass
-from typing import Generator, IO, NoReturn
+from typing import Generator, IO, NoReturn, TypeAlias
 
 from structs.cnmt import Cnmt
 from structs.tik import Tik
 from structs.nacp import Nacp
+
+FileListEntry: TypeAlias = tuple[str, int]
+FileList: TypeAlias = list[FileListEntry]
 
 SCRIPT_PATH: str = os.path.realpath(__file__)
 SCRIPT_NAME: str = os.path.basename(SCRIPT_PATH)
@@ -39,12 +41,15 @@ INITIAL_DIR: str = (CWD if CWD != SCRIPT_DIR else SCRIPT_DIR)
 
 MAX_CPU_THREAD_COUNT: int = psutil.cpu_count()
 
+DEFAULT_KEYS_PATH: str = os.path.join('~', '.switch', 'prod.keys')
+
 CDN_PATH:        str = os.path.join('.', 'cdn')
-HACTOOL_PATH:    str = os.path.join('.', ('hactool.exe' if os.name == 'nt' else 'hactool'))
 HACTOOLNET_PATH: str = os.path.join('.', ('hactoolnet.exe' if os.name == 'nt' else 'hactoolnet'))
-KEYS_PATH:       str = os.path.join('~', '.switch', 'prod.keys')
+KEYS_PATH:       str = DEFAULT_KEYS_PATH
 CERT_PATH:       str = os.path.join('.', 'common.cert')
 OUTPUT_PATH:     str = os.path.join('.', 'out')
+PROCESS_NSP:     bool = False
+KEEP_DELTAS:     bool = False
 NUM_THREADS:     int = MAX_CPU_THREAD_COUNT
 
 HACTOOLNET_DISTRIBUTION_TYPE_REGEX  = re.compile(r'^Distribution type:\s+(.+)$', flags=(re.MULTILINE | re.IGNORECASE))
@@ -55,8 +60,8 @@ HACTOOLNET_VERIFICATION_FAIL_REGEX  = re.compile(r'\(FAIL\)', flags=(re.MULTILIN
 HACTOOLNET_SAVING_REGEX             = re.compile(r'^section\d+:/(.+\.cnmt)$', flags=(re.MULTILINE | re.IGNORECASE))
 HACTOOLNET_MISSING_TITLEKEY_REGEX   = re.compile(r'Missing NCA title key', flags=(re.MULTILINE | re.IGNORECASE))
 HACTOOLNET_ALT_RIGHTS_ID_REGEX      = re.compile(r'Title key for rights ID ([0-9a-f]{32})$', flags=(re.MULTILINE | re.IGNORECASE))
-
-HACTOOL_DECRYPTED_TITLEKEY_REGEX    = re.compile(r'^Titlekey \(Decrypted\)(?: \(From CLI\))?\s+([0-9a-f]{32})$', flags=(re.MULTILINE | re.IGNORECASE))
+HACTOOLNET_DECRYPTED_TITLEKEY_REGEX = re.compile(r'^Titlekey \(Decrypted\)(?: \(From CLI\))?:?\s+([0-9a-f]{32})$', flags=(re.MULTILINE | re.IGNORECASE))
+HACTOOLNET_MKEY_REVISION_REGEX      = re.compile(r'^Master Key Revision:\s+(\d+)\s+\([^\)]+\)$', flags=(re.MULTILINE | re.IGNORECASE))
 
 NCA_DISTRIBUTION_TYPE: str = 'download'
 
@@ -67,8 +72,12 @@ COMMON_CERT_HASH: str = '3c4f20dca231655e90c75b3e9689e4dd38135401029ab1f2ea32d1c
 
 PFS_FULL_HEADER_ALIGNMENT: int = 0x20
 
+BOGUS_TITLEKEYS_PATH: str = ''
+
+EXT_NSP_DATA_PATH: str = ''
+
 def eprint(*args, **kwargs) -> None:
-    print(*args, file=sys.stderr, **kwargs)
+    print(*args, file=sys.stderr, flush=True, **kwargs)
 
 def utilsGetPath(path_arg: str, fallback_path: str, is_file: bool, create: bool = False) -> str:
     path = os.path.abspath(os.path.expanduser(os.path.expandvars(path_arg if path_arg else fallback_path)))
@@ -99,6 +108,13 @@ def utilsCapitalizeString(input: str, sep: str = '') -> str:
     elem = [s.capitalize() for s in input.split('_')]
     return sep.join(elem)
 
+def utilsIsAsciiString(s: str) -> bool:
+    try:
+        s.encode('ascii')
+        return True
+    except UnicodeEncodeError:
+        return False
+
 def utilsGetListChunks(lst: list, n: int) -> Generator:
     for i in range(0, n):
         yield lst[i::n]
@@ -111,18 +127,28 @@ def utilsReconfigureTerminalOutput() -> None:
         if isinstance(sys.stderr, io.TextIOWrapper):
             sys.stderr.reconfigure(encoding='utf-8')
 
-def utilsRunHactoolAtPath(tool_path: str, type: str, args: list[str]) -> subprocess.CompletedProcess[str]:
-    tool_args = [tool_path, '-t', type, '-k', KEYS_PATH, '--disablekeywarns'] + args
-    return subprocess.run(tool_args, capture_output=True, encoding='utf-8')
-
-def utilsRunHactool(type: str, args: list[str]) -> subprocess.CompletedProcess[str]:
-    return utilsRunHactoolAtPath(HACTOOL_PATH, type, args)
-
 def utilsRunHactoolnet(type: str, args: list[str]) -> subprocess.CompletedProcess[str]:
-    return utilsRunHactoolAtPath(HACTOOLNET_PATH, type, args)
+    args = [HACTOOLNET_PATH, '-t', type, '-k', KEYS_PATH, '--titlekeys', BOGUS_TITLEKEYS_PATH, '--disablekeywarns'] + args
+    return subprocess.run(args, capture_output=True, encoding='utf-8')
+
+def utilsCopyKeysFile() -> None:
+    hactoolnet_keys_path = os.path.abspath(os.path.expanduser(os.path.expandvars(DEFAULT_KEYS_PATH)))
+    if KEYS_PATH != hactoolnet_keys_path:
+        os.makedirs(hactoolnet_keys_path, exist_ok=True)
+        shutil.copyfile(KEYS_PATH, hactoolnet_keys_path)
+
+def utilsCreateBogusTitleKeysFile() -> None:
+    global BOGUS_TITLEKEYS_PATH
+    BOGUS_TITLEKEYS_PATH = os.path.join(OUTPUT_PATH, 'bogus_title.keys')
+    with open(BOGUS_TITLEKEYS_PATH, 'w') as fd:
+        pass
+
+def utilsDeleteBogusTitleKeysFile() -> None:
+    if BOGUS_TITLEKEYS_PATH:
+        os.remove(BOGUS_TITLEKEYS_PATH)
 
 def utilsLocateCdnFile(base_path: str, filename: str, size: int = -1) -> str:
-    # Check if we can find the requested file at the provided base path.
+    # Short-circuit: check if we can find the requested file at the provided base path.
     cur_path = os.path.join(base_path, filename)
     if os.path.exists(cur_path) and os.path.isfile(cur_path):
         # Validate size.
@@ -130,23 +156,40 @@ def utilsLocateCdnFile(base_path: str, filename: str, size: int = -1) -> str:
         if (entry_size > 0) and ((size <= 0) or (entry_size == size)):
             return cur_path
 
-    # Recursively scan CDN directory.
-    file_list = glob.glob(pathname=f'**/{filename}', root_dir=CDN_PATH, recursive=True)
-    for cur_path in file_list:
-        cur_path = os.path.join(CDN_PATH, cur_path)
+    def utilsLocateCdnFileRecursiveScan(root: str) -> str:
+        # Recursively scan input directory.
+        file_list = glob.glob(os.path.join(root, '**'), recursive=True)
+        for cur_path in file_list:
+            cur_path = os.path.join(root, cur_path)
 
-        # Skip directories.
-        if os.path.isdir(cur_path):
-            continue
+            # Skip files that don't match our filename.
+            if os.path.basename(cur_path).casefold() != filename.casefold():
+                continue
 
-        # Skip empty files.
-        entry_size = os.path.getsize(cur_path)
-        if (entry_size <= 0) or ((size > 0) and (entry_size != size)):
-            continue
+            # Skip directories.
+            if os.path.isdir(cur_path):
+                continue
 
-        return cur_path
+            # Skip empty files.
+            entry_size = os.path.getsize(cur_path)
+            if (entry_size <= 0) or ((size > 0) and (entry_size != size)):
+                continue
 
-    return ''
+            return cur_path
+
+        return ''
+
+    cur_path = ''
+
+    if PROCESS_NSP and base_path.startswith(EXT_NSP_DATA_PATH):
+        # Look for the requested file within the extracted NSP data directory.
+        cur_path = utilsLocateCdnFileRecursiveScan(EXT_NSP_DATA_PATH)
+
+    if not cur_path:
+        # Look for the requested file within the CDN directory.
+        cur_path = utilsLocateCdnFileRecursiveScan(CDN_PATH)
+
+    return cur_path
 
 @dataclass(init=False)
 class Sha256:
@@ -161,7 +204,7 @@ class Sha256:
 
     @classmethod
     def from_bytes(cls, data: bytes) -> Sha256:
-        fd = BytesIO(data)
+        fd = io.BytesIO(data)
         checksums = cls(fd)
         fd.close()
         return checksums
@@ -216,6 +259,14 @@ class NcaInfo:
         self._cnt_type = cnt_type
 
     @property
+    def id_offset(self) -> int:
+        return self._id_offset
+
+    @id_offset.setter
+    def id_offset(self, id_offset: int) -> None:
+        self._id_offset = id_offset
+
+    @property
     def crypto_type(self) -> str:
         return self._crypto_type
 
@@ -232,9 +283,9 @@ class NcaInfo:
         # Content IDs are just the first half of the NCA's SHA-256 checksum.
         return self._sha256[:32]
 
-    def __init__(self, nca_path: str, nca_size: int, tmp_titlekeys_path: str = '', thrd_id: int = -1, expected_cnt_type: str = '') -> None:
+    def __init__(self, nca_path: str, nca_size: int, enc_titlekey: str = '', thrd_id: int = -1, expected_cnt_type: str = '') -> None:
         # Populate class variables.
-        self._populate_vars(nca_path, nca_size, tmp_titlekeys_path, thrd_id, expected_cnt_type)
+        self._populate_vars(nca_path, nca_size, enc_titlekey, thrd_id, expected_cnt_type)
 
         # Run hactoolnet.
         proc = self._get_hactoolnet_output()
@@ -252,23 +303,22 @@ class NcaInfo:
     def __hash__(self) -> int:
         return hash(self._sha256)
 
-    def __eq__(self, other: NcaInfo) -> bool:
-        if isinstance(other, NcaInfo):
-            return (self._sha256 == other.sha256)
-        return NotImplemented
+    def __eq__(self, other) -> bool:
+        return ((self._sha256 == other.sha256) if isinstance(other, NcaInfo) else False)
 
-    def _populate_vars(self, nca_path: str, nca_size: int, tmp_titlekeys_path: str, thrd_id: int, expected_cnt_type: str) -> None:
+    def _populate_vars(self, nca_path: str, nca_size: int, enc_titlekey: str, thrd_id: int, expected_cnt_type: str) -> None:
         self._nca_path = nca_path
         self._nca_size = nca_size
         self._nca_filename = os.path.basename(self._nca_path)
 
+        self._enc_titlekey = enc_titlekey
         self._thrd_id = thrd_id
-        self._tmp_titlekeys_path = tmp_titlekeys_path
 
         self._expected_cnt_type = expected_cnt_type.lower()
 
         self._dist_type = ''
         self._cnt_type = ''
+        self._id_offset = 0
         self._crypto_type = ''
         self._rights_id = ''
         self._valid = False
@@ -277,7 +327,12 @@ class NcaInfo:
 
     def _get_hactoolnet_output(self) -> subprocess.CompletedProcess[str]:
         # Run hactoolnet.
-        proc = utilsRunHactoolnet('nca', ['--titlekeys', self._tmp_titlekeys_path, '-y', self._nca_path])
+        args: list[str] = []
+        if self._enc_titlekey:
+            args.extend(['--titlekey', self._enc_titlekey])
+        args.extend(['-y', self._nca_path])
+
+        proc = utilsRunHactoolnet('nca', args)
         if (not proc.stdout) or (proc.returncode != 0):
             # Check if we're dealing with a missing titlekey error.
             if proc.stderr and re.search(HACTOOLNET_MISSING_TITLEKEY_REGEX, proc.stderr):
@@ -287,7 +342,7 @@ class NcaInfo:
                 self._raise_exception('placeholder', rights_id)
             else:
                 hactoolnet_stderr = proc.stderr.strip()
-                self._raise_exception(f'Failed to retrieve NCA info{f" ({hactoolnet_stderr})" if hactoolnet_stderr else ""}.')
+                self._raise_exception(f'Failed to retrieve NCA info{f" ({hactoolnet_stderr})" if hactoolnet_stderr else ""}')
 
         return proc
 
@@ -298,7 +353,7 @@ class NcaInfo:
         rights_id = re.search(HACTOOLNET_RIGHTS_ID_REGEX, proc.stdout)
 
         if (not dist_type) or (not cnt_type) or (not crypto_type):
-            self._raise_exception('Failed to parse hactoolnet output.')
+            self._raise_exception('Failed to parse hactoolnet output')
 
         self._dist_type = dist_type.group(1).lower()
         self._cnt_type = cnt_type.group(1).lower()
@@ -307,20 +362,22 @@ class NcaInfo:
         self._valid = (len(re.findall(HACTOOLNET_VERIFICATION_FAIL_REGEX, proc.stdout)) == 0)
 
         if self._dist_type != NCA_DISTRIBUTION_TYPE:
-            self._raise_exception(f'Invalid distribution type (got "{self._dist_type}", expected "{NCA_DISTRIBUTION_TYPE}").')
+            self._raise_exception(f'Invalid distribution type (got "{self._dist_type}", expected "{NCA_DISTRIBUTION_TYPE}")')
 
         if self._expected_cnt_type and (self._cnt_type != self._expected_cnt_type):
-            self._raise_exception(f'Invalid content type (got "{self._cnt_type}", expected "{self._expected_cnt_type}").')
+            self._raise_exception(f'Invalid content type (got "{self._cnt_type}", expected "{self._expected_cnt_type}")')
 
         if (self._crypto_type == 'titlekey') and (not self._rights_id):
-            self._raise_exception('Failed to parse Rights ID from hactoolnet output.')
+            self._raise_exception('Failed to parse Rights ID from hactoolnet output')
 
         if not self._valid:
-            self._raise_exception('Signature/hash verification failed.')
+            self._raise_exception('Signature/hash verification failed')
 
     def _raise_exception(self, msg: str, rights_id: str = '') -> NoReturn:
         if self._thrd_id >= 0:
-            msg = f'(Thread {self._thrd_id}) {msg}'
+            msg = f'(Thread {self._thrd_id}) {msg}.'
+        else:
+            msg = f'NCA "{self._nca_path}": {msg}.'
 
         raise self.Exception(msg, rights_id)
 
@@ -366,15 +423,25 @@ class TikInfo:
     def dec_titlekey(self) -> TitleKeyInfo | None:
         return self._dec_titlekey
 
+    @property
+    def valid_sig(self) -> bool:
+        return self._valid_sig
+
     def __init__(self, rights_id: str, base_path: str, nca_path: str, thrd_id: int) -> None:
         # Populate class variables.
         self._populate_vars(rights_id, base_path, nca_path, thrd_id)
 
-        # Parse encrypted titlekey from ticket file.
-        self._get_encrypted_titlekey()
+        # Parse encrypted titlekey from the provided ticket file.
+        self._get_enc_tk()
 
-        # Get decrypted titlekey.
-        self._get_decrypted_titlekey()
+        # Verify ticket signature.
+        self._verify_tik_sig()
+
+        # Get decrypted titlekey and key generation using the provided NCA.
+        self._get_dec_tk_and_key_gen()
+
+        # Fix tampered ticket, if needed.
+        self._fix_tampered_tik()
 
     def _populate_vars(self, rights_id: str, base_path: str, nca_path: str, thrd_id: int) -> None:
         self._rights_id = rights_id.lower()
@@ -383,48 +450,135 @@ class TikInfo:
         self._thrd_id = thrd_id
 
         self._tik_filename = f'{self._rights_id}.tik'
+
         self._tik_path = utilsLocateCdnFile(self._base_path, self._tik_filename)
+        if self._tik_path and os.path.basename(self._tik_path) != self._tik_filename:
+            # Rename ticket, if needed.
+            tmp_path = os.path.join(os.path.dirname(self._tik_path), self._tik_filename)
+            os.rename(self._tik_path, tmp_path)
+            self._tik_path = tmp_path
+
         self._tik_size = (os.path.getsize(self._tik_path) if self._tik_path else 0)
 
         self._enc_titlekey: TitleKeyInfo | None = None
         self._dec_titlekey: TitleKeyInfo | None = None
 
-    def _get_encrypted_titlekey(self) -> None:
+        self._key_generation = 0
+        self._valid_sig = False
+
+    def _get_enc_tk(self) -> None:
         # Make sure the ticket file exists.
         if not self._tik_path:
             raise self.Exception(f'(Thread {self._thrd_id}) Error: unable to locate ticket file "{self._tik_filename}". Skipping NSP generation for this title.')
 
-        # Parse ticket file.
-        tik = Tik.from_file(self._tik_path)
+        try:
+            # Parse ticket file.
+            tik = Tik.from_file(self._tik_path)
+        except Exception as e:
+            # Reraise the exception as a TikInfo.Exception.
+            raise self.Exception(str(e))
+
+        # Make sure the ticket uses a RSA-2048-PKCS#1 v1.5 + SHA-256 signature.
+        if tik.sig_type != Tik.SignatureType.rsa2048_sha256:
+            raise self.Exception(f'(Thread {self._thrd_id}) Error: ticket "{self._tik_filename}" doesn\'t use a RSA-2048-PKCS#1 v1.5 + SHA-256 signature. Skipping NSP generation for this title.')
 
         # Make sure the ticket uses common crypto.
         if tik.titlekey_type != Tik.TitlekeyType.common:
             raise self.Exception(f'(Thread {self._thrd_id}) Error: ticket "{self._tik_filename}" doesn\'t use common crypto. Skipping NSP generation for this title.')
 
-        # Save encrypted titlekey.
-        enc_titlekey = tik.titlekey_block[:16].hex().lower()
-        self._enc_titlekey = TitleKeyInfo(enc_titlekey, self._rights_id)
+        # Load encrypted titlekey right away.
+        self._enc_titlekey = TitleKeyInfo(tik.titlekey_block[:16].hex().lower(), self._rights_id)
 
         # Close ticket.
         tik.close()
 
-    def _get_decrypted_titlekey(self) -> None:
+    def _verify_tik_sig(self) -> None:
+        # Read RSA public key from the certificate chain.
+        with open(CERT_PATH, 'rb') as fd:
+            fd.seek(0x5C8)
+            modulus = int.from_bytes(fd.read(0x100), 'big')
+            pub_exp = int.from_bytes(fd.read(0x4), 'big')
+
+        pub_key = rsa.PublicKey(modulus, pub_exp)
+
+        # Read signature and message from the ticket itself.
+        with open(self._tik_path, 'rb') as fd:
+            fd.seek(0x4)
+            signature = fd.read(0x100)
+
+            fd.seek(0x140)
+            message = fd.read()
+
+        try:
+            # Verify ticket signature.
+            rsa.verify(message, signature, pub_key)
+        except rsa.VerificationError:
+            # Invalid signature.
+            self._valid_sig = False
+        else:
+            # Valid signature. We'll keep the ticket untouched.
+            self._valid_sig = True
+
+        print(f'(Thread {self._thrd_id}) Signature for common ticket "{self._tik_filename}" is {"valid" if self._valid_sig else "invalid"}.', flush=True)
+
+    def _get_dec_tk_and_key_gen(self) -> None:
         if not self._enc_titlekey:
             return
 
-        # We'll actually use old hactool here.
-        proc = utilsRunHactool('nca', [f'--titlekey={self._enc_titlekey.value}', self._nca_path])
-        hactool_stderr = proc.stderr.strip()
+        # Get decrypted titlekey and key generation from hactoolnet output.
+        proc = utilsRunHactoolnet('nca', ['--titlekey', self._enc_titlekey.value, self._nca_path])
+        hactoolnet_stderr = proc.stderr.strip()
         if (not proc.stdout) or (proc.returncode != 0):
-            raise self.Exception(f'(Thread {self._thrd_id}) Failed to get decrypted titlekey{f" ({hactool_stderr})" if hactool_stderr else ""}.')
+            raise self.Exception(f'(Thread {self._thrd_id}) Failed to retrieve NCA info for ticket{f" ({hactoolnet_stderr})" if hactoolnet_stderr else ""}. Skipping NSP generation for this title.')
 
-        dec_titlekey = re.search(HACTOOL_DECRYPTED_TITLEKEY_REGEX, proc.stdout)
-        dec_titlekey = (dec_titlekey.group(1).lower() if dec_titlekey else '')
-        if not dec_titlekey:
-            raise self.Exception(f'(Thread {self._thrd_id}) Failed to parse decrypted titlekey from hactool output{f" ({hactool_stderr})" if hactool_stderr else ""}.')
+        dec_titlekey = re.search(HACTOOLNET_DECRYPTED_TITLEKEY_REGEX, proc.stdout)
+        nca_key_generation = re.search(HACTOOLNET_MKEY_REVISION_REGEX, proc.stdout)
 
-        # Save decrypted titlekey.
+        if (not dec_titlekey) or (not nca_key_generation):
+            raise self.Exception(f'(Thread {self._thrd_id}) Failed to parse plaintext keydata from hactoolnet output. Skipping NSP generation for this title.')
+
+        dec_titlekey = dec_titlekey.group(1).lower()
+        nca_key_generation = int(nca_key_generation.group(1))
+
+        if nca_key_generation > 0:
+            # Convert back to a true NCA key generation value.
+            nca_key_generation += 1
+
+        # Validate key generation value.
+        key_gen_rid = int.from_bytes(bytes.fromhex(self._rights_id[-2:]), 'little', signed=False)
+        old_key_gen = (nca_key_generation < 3)
+
+        if (old_key_gen and key_gen_rid) or ((not old_key_gen) and key_gen_rid != nca_key_generation):
+            expected_key_gen = (0 if old_key_gen else nca_key_generation)
+            raise self.Exception(f'(Thread {self._thrd_id}) Error: invalid rights ID key generation! Got 0x{key_gen_rid:02X}, expected 0x{expected_key_gen:02X}. Skipping NSP generation for this title.')
+
+        # Save values.
         self._dec_titlekey = TitleKeyInfo(dec_titlekey, self._rights_id)
+        self._key_generation = nca_key_generation
+
+    def _fix_tampered_tik(self) -> None:
+        if self._valid_sig or (not self._enc_titlekey):
+            return
+
+        # Serialize a new common ticket.
+        tik = struct.pack('<I', Tik.SignatureType.rsa2048_sha256.value)
+        tik += b'\xFF' * 0x100
+        tik += b'\x00' * 0x3C
+
+        tik += struct.pack('64s', b'Root-CA00000003-XS00000020')
+
+        tik += self._enc_titlekey.raw_value
+        tik += b'\x00' * 0xF0
+
+        tik += struct.pack('<BBHBBH8xQQ', 2, Tik.TitlekeyType.common.value, 0, Tik.LicenseType.permanent.value, self._key_generation, 0, 0, 0)
+        tik += bytes.fromhex(self._rights_id)
+        tik += struct.pack('<IIIHH', 0, 0, 0x2C0, 0, 0)
+
+        # Write common ticket.
+        with open(self._tik_path, 'wb') as fd:
+            fd.write(tik)
+
+        print(f'(Thread {self._thrd_id}) Wrote 0x{os.path.getsize(self._tik_path):X}-byte long fixed tampered ticket to "{self._tik_path}".', flush=True)
 
 @dataclass(init=False)
 class NacpLanguageEntry:
@@ -436,6 +590,9 @@ class NacpLanguageEntry:
         self.name = nacp_title.name.strip()
         self.publisher = nacp_title.publisher.strip()
         self.lang = Nacp.Language(lang)
+
+        if not self.name:
+            raise ValueError('Invalid Title name.')
 
 class PartitionFileSystem:
     class Exception(Exception):
@@ -450,8 +607,8 @@ class PartitionFileSystem:
         def __len__(self) -> int:
             return 0x10
 
-        def serialize(self) -> bytes:
-            return struct.pack('<4sIII', 'PFS0'.encode(), self.entry_count & 0xFFFFFFFF, self.name_table_size & 0xFFFFFFFF, 0)
+        def serialize(self, name_table_padding_size: int) -> bytes:
+            return struct.pack('<4sIII', 'PFS0'.encode(), self.entry_count & 0xFFFFFFFF, (self.name_table_size + name_table_padding_size) & 0xFFFFFFFF, 0)
 
     @dataclass
     class Entry:
@@ -477,7 +634,7 @@ class PartitionFileSystem:
 
     def add_entry(self, name: str, size: int) -> None:
         if (not name) or (size <= 0):
-            raise NspGenerator.Exception(f'(Thread {self._thrd_id}) Error: invalid arguments for new PFS entry.')
+            raise self.Exception(f'(Thread {self._thrd_id}) Error: invalid arguments for new PFS entry.')
 
         # Generate new PFS entry.
         entry = PartitionFileSystem.Entry(self._cur_entry_offset, size, self._cur_name_offset)
@@ -496,23 +653,23 @@ class PartitionFileSystem:
         self._cur_entry_offset += size
         self._cur_name_offset = len(self._name_table)
 
+    def get_total_size(self) -> int:
+        return (self._get_header_sizes()[1] + self._cur_entry_offset)
+
     def serialize(self) -> bytes:
         if (self._header.entry_count <= 0) or (self._header.name_table_size <= 0) or (len(self._entries) != self._header.entry_count) or (not self._name_table):
             raise self.Exception(f'(Thread {self._thrd_id}) Error: unable to serialize empty PFS object.')
 
         raw_header: bytes = b''
 
-        # Calculate header size.
-        header_size = (len(self._header) + (len(self._entries) * len(self._entries[0])) + len(self._name_table))
+        # Get unpadded and padded header sizes.
+        (header_size, padded_header_size) = self._get_header_sizes()
 
-        # Calculate padded header size and padding size.
-        padded_header_size = (utilsAlignUp(header_size + 1, PFS_FULL_HEADER_ALIGNMENT) if utilsIsAligned(header_size, PFS_FULL_HEADER_ALIGNMENT) else utilsAlignUp(header_size, PFS_FULL_HEADER_ALIGNMENT))
+        # Calculate padding size.
         padding_size = (padded_header_size - header_size)
 
         # Serialize full header.
-        self._header.name_table_size += padding_size
-        raw_header += self._header.serialize()
-        self._header.name_table_size -= padding_size
+        raw_header += self._header.serialize(padding_size)
 
         for entry in self._entries:
             raw_header += entry.serialize()
@@ -522,6 +679,11 @@ class PartitionFileSystem:
         raw_header += (b'\x00' * padding_size)
 
         return raw_header
+
+    def _get_header_sizes(self) -> tuple[int, int]:
+        header_size = (len(self._header) + (len(self._entries) * len(self._entries[0])) + len(self._name_table))
+        padded_header_size = ((header_size + PFS_FULL_HEADER_ALIGNMENT) if utilsIsAligned(header_size, PFS_FULL_HEADER_ALIGNMENT) else utilsAlignUp(header_size, PFS_FULL_HEADER_ALIGNMENT))
+        return (header_size, padded_header_size)
 
 class NspGenerator:
     class Exception(Exception):
@@ -572,9 +734,9 @@ class NspGenerator:
     def contents(self) -> list[NcaInfo]:
         return self._contents
 
-    def __init__(self, meta_nca: NcaInfo, tmp_titlekeys_path: str, thrd_id: int) -> None:
+    def __init__(self, meta_nca: NcaInfo, tmp_path: str, thrd_id: int) -> None:
         # Populate class variables.
-        self._populate_vars(meta_nca, tmp_titlekeys_path, thrd_id)
+        self._populate_vars(meta_nca, tmp_path, thrd_id)
 
         # Extract CNMT file from the provided Meta NCA.
         self._extract_and_parse_cnmt()
@@ -588,10 +750,9 @@ class NspGenerator:
         # Perform cleanup.
         self._cleanup()
 
-    def _populate_vars(self, meta_nca: NcaInfo, tmp_titlekeys_path: str, thrd_id: int) -> None:
+    def _populate_vars(self, meta_nca: NcaInfo, tmp_path: str, thrd_id: int) -> None:
         self._meta_nca = meta_nca
-        self._tmp_path = os.path.dirname(tmp_titlekeys_path)
-        self._tmp_titlekeys_path = tmp_titlekeys_path
+        self._tmp_path = tmp_path
         self._thrd_id = thrd_id
 
         self._cnmt_path = ''
@@ -626,7 +787,7 @@ class NspGenerator:
         self._cleanup_called = False
 
     def _extract_and_parse_cnmt(self) -> None:
-        print(f'(Thread {self._thrd_id}) Extracting CNMT from "{os.path.basename(self._meta_nca.path)}"...', flush=True)
+        print(f'(Thread {self._thrd_id}) Extracting CNMT from "{self._meta_nca.path}"...', flush=True)
 
         # Extract files from Meta NCA FS section 0.
         proc = utilsRunHactoolnet('nca', ['--section0dir', self._tmp_path, self._meta_nca.path])
@@ -636,7 +797,7 @@ class NspGenerator:
         # Get extracted CNMT filename from hactoolnet's output.
         cnmt_filename = re.search(HACTOOLNET_SAVING_REGEX, proc.stdout)
         if (not cnmt_filename):
-            raise self.Exception(f'(Thread {self._thrd_id}) Error: failed to parse CNMT filename from hactool output. Skipping NSP generation for this title.')
+            raise self.Exception(f'(Thread {self._thrd_id}) Error: failed to parse CNMT filename from hactoolnet output. Skipping NSP generation for this title.')
 
         # Make sure the CNMT was extracted.
         cnmt_filename = cnmt_filename.group(1).strip()
@@ -644,8 +805,12 @@ class NspGenerator:
         if not os.path.exists(self._cnmt_path):
             raise self.Exception(f'(Thread {self._thrd_id}) Error: failed to locate CNMT file after extraction. Skipping NSP generation for this title.')
 
-        # Parse CNMT file.
-        self._cnmt = Cnmt.from_file(self._cnmt_path)
+        try:
+            # Parse CNMT file.
+            self._cnmt = Cnmt.from_file(self._cnmt_path)
+        except Exception as e:
+            # Reraise the exception as a NspGenerator.Exception.
+            raise self.Exception(str(e))
 
         # Update class properties.
         self._title_id = f'{self._cnmt.header.title_id:016x}'
@@ -658,7 +823,7 @@ class NspGenerator:
 
         # Make sure we're dealing with a supported title type.
         if (self._title_type.value < Cnmt.ContentMetaType.application.value) or (self._title_type.value > Cnmt.ContentMetaType.data_patch.value) or (self._title_type.value == Cnmt.ContentMetaType.delta.value):
-            raise self.Exception(f'(Thread {self._thrd_id}) Error: invalid content meta type value (0x{self._title_type.value:02x}). Skipping NSP generation for this title.')
+            raise self.Exception(f'(Thread {self._thrd_id}) Error: invalid content meta type value (0x{self._title_type.value:02X}). Skipping NSP generation for this title.')
 
     def _build_content_list(self) -> None:
         if not self._cnmt:
@@ -666,7 +831,7 @@ class NspGenerator:
 
         content_count = self._cnmt.header.content_count
 
-        print(f'(Thread {self._thrd_id}) Parsing {content_count} content record(s) from "{os.path.basename(self._meta_nca.path)}"...', flush=True)
+        print(f'(Thread {self._thrd_id}) Processing {content_count} content record(s) from "{os.path.basename(self._cnmt_path)}"...', flush=True)
 
         # Iterate over all content records.
         for i in range(content_count):
@@ -679,7 +844,12 @@ class NspGenerator:
             if not isinstance(nca_size, int):
                 continue
 
-            print(f'(Thread {self._thrd_id}) Parsing {utilsCapitalizeString(cnt_type, " ")} NCA #{packaged_content_info.info.id_offset}: "{nca_filename}".', flush=True)
+            # Skip current content record if it references a DeltaFragment NCA and the user decided to exclude them.
+            if (not KEEP_DELTAS) and (cnt_type == 'delta_fragment'):
+                print(f'(Thread {self._thrd_id}) Skipping DeltaFragment NCA: "{nca_filename}".', flush=True)
+                continue
+
+            print(f'(Thread {self._thrd_id}) Parsing {utilsCapitalizeString(cnt_type)} NCA #{packaged_content_info.info.id_offset}: "{nca_filename}".', flush=True)
 
             # Locate target NCA file.
             nca_path = utilsLocateCdnFile(os.path.dirname(self._meta_nca.path), nca_filename, nca_size)
@@ -699,10 +869,13 @@ class NspGenerator:
 
             # Verify content ID.
             if (packaged_content_info.info.id != packaged_content_info.hash[:16]) or (packaged_content_info.info.id.hex().lower() != nca_info.cnt_id):
-                raise self.Exception(f'(Thread {self._thrd_id}) Error: content ID / hash mismatch.')
+                raise self.Exception(f'(Thread {self._thrd_id}) Error: content ID / hash mismatch. Skipping NSP generation for this title.')
 
             # Replace NCA info's content type with the type stored in the CNMT, because it's more descriptive.
             nca_info.cnt_type = cnt_type
+
+            # Set NCA info's ID offset value.
+            nca_info.id_offset = packaged_content_info.info.id_offset
 
             # Update contents list.
             self._contents.append(nca_info)
@@ -717,7 +890,7 @@ class NspGenerator:
     def _get_nca_info(self, nca_path: str, nca_size: int) -> NcaInfo:
         try:
             # Retrieve NCA information.
-            nca_info = NcaInfo(nca_path, nca_size, self._tmp_titlekeys_path, self._thrd_id)
+            nca_info = NcaInfo(nca_path, nca_size, self._tik_info.enc_titlekey.value if (self._tik_info and self._tik_info.enc_titlekey) else '', self._thrd_id)
         except NcaInfo.Exception as e:
             # Check if we're dealing with a missing titlekey.
             if e.rights_id and (not self._rights_id):
@@ -729,7 +902,7 @@ class NspGenerator:
 
                 try:
                     # Try to retrieve NCA information once more, this time using proper titlekey crypto info.
-                    nca_info = NcaInfo(nca_path, nca_size, self._tmp_titlekeys_path, self._thrd_id)
+                    nca_info = NcaInfo(nca_path, nca_size, self._tik_info.enc_titlekey.value if (self._tik_info and self._tik_info.enc_titlekey) else '', self._thrd_id)
                 except NcaInfo.Exception as e:
                     # Reraise the exception as a NspGenerator.Exception.
                     raise self.Exception(str(e))
@@ -740,6 +913,9 @@ class NspGenerator:
         return nca_info
 
     def _get_tik_info(self, nca_path: str) -> None:
+        if not self._title_type:
+            return
+
         try:
             # Retrieve ticket file info.
             self._tik_info = TikInfo(self._rights_id, os.path.dirname(self._meta_nca.path), nca_path, self._thrd_id)
@@ -747,9 +923,9 @@ class NspGenerator:
             # Reraise the exception as a NspGenerator.Exception.
             raise self.Exception(str(e))
 
-        # Update temporary titlekeys file for this thread.
-        with open(self._tmp_titlekeys_path, 'a', encoding='utf-8') as fd:
-            fd.write(f'{self._rights_id} = {self._tik_info.enc_titlekey.value if self._tik_info.enc_titlekey else ""}\n')
+        # Make sure the ticket signature is valid if we're dealing with a Patch or DataPatch title.
+        if (not self._tik_info.valid_sig) and ((self._title_type == Cnmt.ContentMetaType.patch) or (self._title_type == Cnmt.ContentMetaType.data_patch)):
+            raise self.Exception(f'(Thread {self._thrd_id}) Error: invalid ticket signature for Patch / DataPatch title. Skipping NSP generation for this title.')
 
         # Generate certificate chain filename.
         self._cert_filename = f'{self._rights_id}.cert'
@@ -767,8 +943,12 @@ class NspGenerator:
             eprint(f'(Thread {self._thrd_id}) Error: failed to locate NACP file after extraction. Skipping additional metadata retrieval for current title.')
             return
 
-        # Parse NACP file.
-        self._nacp = Nacp.from_file(self._nacp_path)
+        try:
+            # Parse NACP file.
+            self._nacp = Nacp.from_file(self._nacp_path)
+        except Exception:
+            eprint(f'(Thread {self._thrd_id}) Error: failed to parse NACP file. Skipping additional metadata retrieval for current title.')
+            return
 
         # Retrieve NACP language entry data.
         for lang in Nacp.Language:
@@ -783,8 +963,12 @@ class NspGenerator:
             # Get current NACP Title entry.
             nacp_title: Nacp.Title = self._nacp.title[lang.value]
 
-            # Build a NacpLanguageEntry object using
-            nacp_lang_entry = NacpLanguageEntry(nacp_title, lang.value)
+            try:
+                # Build a NacpLanguageEntry object using this Title entry.
+                # Don't proceed any further if object initialization fails.
+                nacp_lang_entry = NacpLanguageEntry(nacp_title, lang.value)
+            except Exception:
+                continue
 
             # Update language entry dictionary.
             self._lang_entries.append(nacp_lang_entry)
@@ -836,7 +1020,7 @@ class NspGenerator:
 
         version = (f' {self._display_version} ' if (self._display_version and self._title_type == Cnmt.ContentMetaType.patch) else ' ')
 
-        return f'{self._normalize_fs_str(name)}{version}[{self._title_id.upper()}][v{self._title_version}][{filename_type_strings.get(self._title_type.value)}].nsp'
+        return self._normalize_fs_str(f'{name}{version}[{self._title_id.upper()}][v{self._title_version}][{filename_type_strings.get(self._title_type.value)}].nsp')
 
     def _normalize_fs_str(self, name: str) -> str:
         # Replace illegal filesystem characters with underscores.
@@ -877,7 +1061,7 @@ class NspGenerator:
         if not self._nsp_fd:
             return
 
-        print(f'(Thread {self._thrd_id}) Writing "{os.path.basename(path)}" (0x{os.path.getsize(path):X} bytes long)...')
+        print(f'(Thread {self._thrd_id}) Writing "{os.path.basename(path)}" (0x{os.path.getsize(path):X} bytes long)...', flush=True)
 
         # Open NCA.
         with open(path, 'rb') as fd:
@@ -895,7 +1079,7 @@ class NspGenerator:
         if not self._nsp_fd:
             return
 
-        print(f'(Thread {self._thrd_id}) Writing "{self._cert_filename}" (0x{COMMON_CERT_SIZE:X} bytes long)...')
+        print(f'(Thread {self._thrd_id}) Writing "{self._cert_filename}" (0x{COMMON_CERT_SIZE:X} bytes long)...', flush=True)
 
         with open(CERT_PATH, 'rb') as fd:
             self._nsp_fd.write(fd.read())
@@ -951,17 +1135,14 @@ def utilsProcessMetaNcaList(meta_nca_list_chunks: list[list[NcaInfo]], results: 
     meta_nca_list = meta_nca_list_chunks[thrd_id]
     thrd_res: list[NspGenerator] = []
 
-    # Create temporary directory and titlekeys file for this thread.
-    tmp_path = os.path.join(OUTPUT_PATH, f'{utilsGetRandomString(32)}_{thrd_id}')
-    tmp_titlekeys_path = os.path.join(tmp_path, 'title.keys')
+    # Create temporary directory for this thread.
+    tmp_path = os.path.join(OUTPUT_PATH, f'proc_{utilsGetRandomString(16)}_{thrd_id}')
     os.makedirs(tmp_path, exist_ok=True)
-    with open(tmp_titlekeys_path, 'w'):
-        pass
 
     # Generate NSP files.
     for meta_nca in meta_nca_list:
         try:
-            nsp_gen = NspGenerator(meta_nca, tmp_titlekeys_path, thrd_id)
+            nsp_gen = NspGenerator(meta_nca, tmp_path, thrd_id)
         except NspGenerator.Exception as e:
             eprint(str(e))
             continue
@@ -978,9 +1159,9 @@ def utilsProcessMetaNcaList(meta_nca_list_chunks: list[list[NcaInfo]], results: 
 def utilsGetMetaNcaList(path: str) -> list[NcaInfo]:
     meta_nca_infos: list[NcaInfo] = []
 
-    print('Building list with parsed Meta NCA information...\n', flush=True)
+    print(f'Building list with parsed Meta NCA data from "{path}"...', flush=True)
 
-    # Recursively scan CDN directory. We'll look for all the available Meta NCAs.
+    # Recursively scan the provided directory. We'll look for all the available Meta NCAs.
     meta_nca_list = glob.glob(os.path.join(path, '**', '*.cnmt.nca'), recursive=True)
 
     for cur_path in meta_nca_list:
@@ -1005,19 +1186,146 @@ def utilsGetMetaNcaList(path: str) -> list[NcaInfo]:
         # Update Meta NCA list.
         meta_nca_infos.append(nca_info)
 
-    # Deduplicate Meta NCA list.
-    meta_nca_infos = list(set(meta_nca_infos))
-
     return meta_nca_infos
+
+def utilsGetNspFileList(path: str) -> FileList:
+    nsp_list: FileList = []
+
+    print('Building NSP/NSZ file list...', flush=True)
+
+    # Scan directory.
+    for fileref in pathlib.Path(path).rglob('*'):
+        cur_path = str(fileref)
+        entry_name = os.path.basename(cur_path).lower()
+
+        # Skip directories and files that don't match our criteria.
+        if os.path.isdir(cur_path) or (not (entry_name.endswith('.nsp') or entry_name.endswith('.nsz'))):
+            continue
+
+        # Skip empty files.
+        file_size = os.path.getsize(cur_path)
+        if not file_size:
+            continue
+
+        # Update list.
+        nsp_list.append((cur_path, file_size))
+
+    if nsp_list:
+        print(f'{len(nsp_list)} NSP/NSZ file(s) located.', flush=True)
+    else:
+        eprint('Warning: "--process-nsp" was used, but no NSP/NSZ files could be located within the CDN directory.')
+
+    return nsp_list
+
+def utilsConvertNsz(nsz_path: str, tmp_path: str) -> str:
+    print(f'Converting "{nsz_path}" to NSP...', flush=True)
+
+    nsz_args = ['nsz', '-D', '-o', tmp_path, nsz_path]
+    nsp_path = os.path.join(tmp_path, f'{os.path.splitext(os.path.basename(nsz_path))[0]}.nsp')
+
+    proc = subprocess.run(nsz_args, capture_output=True, encoding='utf-8')
+    new_nsp_size = (os.path.getsize(nsp_path) if os.path.exists(nsp_path) else 0)
+
+    if (not proc.stdout) or (proc.returncode != 0) or (new_nsp_size <= 0):
+        eprint(f'Error: failed to convert NSZ to NSP.')
+
+        if os.path.exists(nsp_path):
+            os.remove(nsp_path)
+
+        return ''
+
+    return nsp_path
+
+def utilsExtractNsp(nsp_path: str, tmp_path: str) -> str:
+    print(f'Extracting "{nsp_path}"...', flush=True)
+
+    # Extract files from the provided NSP.
+    nsz_args = ['nsz', '-x', '-o', tmp_path, nsp_path]
+    ext_nsp_path = os.path.join(tmp_path, os.path.splitext(os.path.basename(nsp_path))[0])
+
+    proc = subprocess.run(nsz_args, capture_output=True, encoding='utf-8')
+    if (not proc.stdout) or (proc.returncode != 0) or (not os.path.exists(ext_nsp_path)):
+        eprint(f'Error: failed to extract NSP.')
+
+        if os.path.exists(ext_nsp_path):
+            shutil.rmtree(ext_nsp_path, ignore_errors=True)
+
+        return ''
+
+    # Rename extracted NSP directory.
+    new_ext_nsp_path = os.path.join(tmp_path, f'nsp_{utilsGetRandomString(16)}')
+    os.rename(ext_nsp_path, new_ext_nsp_path)
+
+    return new_ext_nsp_path
+
+def utilsBuildMetaNcaListFromNspFiles(input_path: str, tmp_path: str) -> list[NcaInfo]:
+    cnt = 0
+
+    # Get NSP file list.
+    nsp_list = utilsGetNspFileList(input_path)
+    if not nsp_list:
+        return []
+
+    for (nsp_path, _) in nsp_list:
+        is_nsz = nsp_path.lower().endswith('.nsz')
+        orig_nsp_path = nsp_path
+        renamed_nsp_path = ''
+
+        # Handle filenames with non-ASCII codepoints.
+        if not utilsIsAsciiString(nsp_path):
+            renamed_nsp_path = os.path.join(os.path.dirname(nsp_path), f'{utilsGetRandomString(16)}.{"nsz" if is_nsz else "nsp"}')
+            os.rename(nsp_path, renamed_nsp_path)
+            nsp_path = renamed_nsp_path
+
+        # Convert NSZ to NSP, if needed.
+        if is_nsz:
+            nsp_path = utilsConvertNsz(nsp_path, tmp_path)
+            if not nsp_path:
+                continue
+
+        # Extract NSP.
+        ext_nsp_path = utilsExtractNsp(nsp_path, tmp_path)
+
+        # Delete NSZ -> NSP conversion, if needed.
+        if is_nsz:
+            os.remove(nsp_path)
+
+        # Rename NSP, if needed.
+        if renamed_nsp_path:
+            os.rename(renamed_nsp_path, orig_nsp_path)
+
+        # Check if the extraction went okay.
+        if not ext_nsp_path:
+            continue
+
+        # Update counter.
+        cnt += 1
+
+    if cnt <= 0:
+        eprint(f'Error: failed to extract any NSP(s) from the input directory.')
+        return []
+
+    # Return list with Meta NCA information.
+    return utilsGetMetaNcaList(tmp_path)
 
 def utilsProcessCdnDirectory() -> None:
     meta_nca_infos: list[NcaInfo] = []
     nsp_gen_list: list[NspGenerator] = []
 
+    if PROCESS_NSP:
+        # Build Meta NCA list from NSP files.
+        meta_nca_infos = utilsBuildMetaNcaListFromNspFiles(CDN_PATH, EXT_NSP_DATA_PATH)
+
     # Collect information from all available Meta NCAs.
-    meta_nca_infos = utilsGetMetaNcaList(CDN_PATH)
+    meta_nca_infos.extend(utilsGetMetaNcaList(CDN_PATH))
     if not meta_nca_infos:
-        raise FileNotFoundError('Error: failed to locate and parse any Meta NCAs within the CDN directory.')
+        eprint('Error: failed to locate and parse any Meta NCAs.')
+        return
+
+    # Deduplicate Meta NCA list.
+    meta_nca_infos = list(set(meta_nca_infos))
+
+    print(f'{len(meta_nca_infos)} Meta NCA(s) located and parsed.\n', flush=True)
 
     # Create processing threads.
     meta_nca_list_chunks: list[list[NcaInfo]] = list(filter(None, list(utilsGetListChunks(meta_nca_infos, NUM_THREADS))))
@@ -1041,12 +1349,30 @@ def utilsProcessCdnDirectory() -> None:
 
     # Check if we were able to populate our NSP list.
     if not nsp_gen_list:
-        raise ValueError('Error: failed to generate any NSP files.')
+        eprint('Error: failed to generate any NSP files.')
+        return
 
     # Display results.
-    print('\nResults:\n')
+    print('\nResults:\n', flush=True)
     for nsp_gen in nsp_gen_list:
-        print(f'\t- {nsp_gen.filename} (0x{os.path.getsize(nsp_gen.path)} bytes long).')
+        print(f'  - {nsp_gen.filename} ({os.path.getsize(nsp_gen.path)} bytes long).', flush=True)
+
+def utilsPrepareNspRequirements() -> None:
+    global EXT_NSP_DATA_PATH
+
+    if not PROCESS_NSP:
+        return
+
+    # Check if nsz has been installed.
+    if not shutil.which('nsz'):
+        raise ValueError('Error: "nsz" package unavailable.')
+
+    # Copy keys file (required by nsz since it offers no way to provide a keys file path).
+    utilsCopyKeysFile()
+
+    # Update extracted NSP data path.
+    EXT_NSP_DATA_PATH = os.path.join(OUTPUT_PATH, 'ext_nsp_data')
+    os.makedirs(EXT_NSP_DATA_PATH, exist_ok=True)
 
 def utilsValidateCommonCertChain() -> None:
     # Validate certificate chain size.
@@ -1066,20 +1392,21 @@ def utilsValidateThreadCount(num_threads: str) -> int:
     return val
 
 def main() -> int:
-    global CDN_PATH, HACTOOL_PATH, HACTOOLNET_PATH, KEYS_PATH, CERT_PATH, OUTPUT_PATH, NUM_THREADS
+    global CDN_PATH, HACTOOLNET_PATH, KEYS_PATH, CERT_PATH, OUTPUT_PATH, PROCESS_NSP, KEEP_DELTAS, NUM_THREADS
 
     # Reconfigure terminal output whenever possible.
     utilsReconfigureTerminalOutput()
 
-    parser = argparse.ArgumentParser(description='Deterministically recreates Nintendo Submission Packages (NSP) files from extracted CDN data following nxdumptool NSP generation guidelines.')
+    parser = argparse.ArgumentParser(description='Deterministically recreates Nintendo Submission Packages (NSP) files from extracted CDN data following NSP generation guidelines from nxdumptool.')
 
     parser.add_argument('--cdndir', type=str, metavar='DIR', default='', help=f'Path to directory with extracted CDN data (will be processed recursively). Defaults to "{CDN_PATH}".')
-    parser.add_argument('--hactool', type=str, metavar='FILE', default='', help=f'Path to hactool binary. Defaults to "{HACTOOL_PATH}".')
     parser.add_argument('--hactoolnet', type=str, metavar='FILE', default='', help=f'Path to hactoolnet binary. Defaults to "{HACTOOLNET_PATH}".')
     parser.add_argument('--keys', type=str, metavar='FILE', default='', help=f'Path to Nintendo Switch keys file. Defaults to "{KEYS_PATH}".')
-    parser.add_argument('--cert', type=str, metavar='FILE', default='', help=f'Path to 0x{COMMON_CERT_SIZE:x}-byte long Nintendo Switch common certificate chain with SHA-256 checksum "{COMMON_CERT_HASH.upper()}". Defaults to "{CERT_PATH}".')
+    parser.add_argument('--cert', type=str, metavar='FILE', default='', help=f'Path to 0x{COMMON_CERT_SIZE:X}-byte long Nintendo Switch common certificate chain with SHA-256 checksum "{COMMON_CERT_HASH.upper()}". Used to validate RSA signatures from tickets. Defaults to "{CERT_PATH}".')
     parser.add_argument('--outdir', type=str, metavar='DIR', default='', help=f'Path to output directory. Defaults to "{OUTPUT_PATH}".')
-    parser.add_argument('--num-threads', type=utilsValidateThreadCount, metavar='VALUE', default=NUM_THREADS, help=f'Sets the number of threads used to process input NSP/NSZ files. Defaults to {NUM_THREADS} if not provided. This value must not be exceeded.')
+    parser.add_argument('--process-nsp', action='store_true', default=PROCESS_NSP, help='Unpacks any NSP/NSZ files found within the provided CDN directory and repacks them into deterministic NSPs whenever possible. Disabled by default. Requires nsz to be installed.')
+    parser.add_argument('--keep-deltas', action='store_true', default=KEEP_DELTAS, help='Writes any available Delta Fragment NCAs referenced by Meta NCAs to the output NSPs. Disabled by default.')
+    parser.add_argument('--num-threads', type=utilsValidateThreadCount, metavar='VALUE', default=NUM_THREADS, help=f'Sets the number of threads used to process CDN data. Defaults to {NUM_THREADS} if not provided. This value must not be exceeded.')
 
     print(f'{SCRIPT_NAME}.\nMade by DarkMatterCore.\n', flush=True)
 
@@ -1087,18 +1414,32 @@ def main() -> int:
     args = parser.parse_args()
 
     CDN_PATH = utilsGetPath(args.cdndir, os.path.join(INITIAL_DIR, CDN_PATH), False)
-    HACTOOL_PATH = utilsGetPath(args.hactool, os.path.join(INITIAL_DIR, HACTOOL_PATH), True)
     HACTOOLNET_PATH = utilsGetPath(args.hactoolnet, os.path.join(INITIAL_DIR, HACTOOLNET_PATH), True)
     KEYS_PATH = utilsGetPath(args.keys, KEYS_PATH, True)
     CERT_PATH = utilsGetPath(args.cert, CERT_PATH, True)
     OUTPUT_PATH = utilsGetPath(args.outdir, os.path.join(INITIAL_DIR, OUTPUT_PATH), False, True)
+    PROCESS_NSP = args.process_nsp
+    KEEP_DELTAS = args.keep_deltas
     NUM_THREADS = args.num_threads
 
     # Validate common certificate chain.
     utilsValidateCommonCertChain()
 
+    # Prepare NSP processing requirements.
+    utilsPrepareNspRequirements()
+
+    # Create bogus titlekeys file.
+    utilsCreateBogusTitleKeysFile()
+
     # Do our thing.
     utilsProcessCdnDirectory()
+
+    # Delete bogus titlekeys file.
+    utilsDeleteBogusTitleKeysFile()
+
+    if PROCESS_NSP:
+        # Remove extracted NSP data.
+        shutil.rmtree(EXT_NSP_DATA_PATH, ignore_errors=True)
 
     return 0
 
@@ -1110,8 +1451,8 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         time.sleep(0.2)
         eprint('\nScript interrupted.')
-    except (ValueError, FileNotFoundError) as e:
-        print(str(e))
+    except ValueError as e:
+        eprint(str(e))
     except Exception:
         traceback.print_exc()
 

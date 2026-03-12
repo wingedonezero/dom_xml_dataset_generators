@@ -12,7 +12,11 @@ __pycache__
 *.txt
 *.rar
 *.nsp
+*.nsz
 hactool*
 *.keys
 *.dat
 *.cert
+*.diff
+
+!requirements.txt
