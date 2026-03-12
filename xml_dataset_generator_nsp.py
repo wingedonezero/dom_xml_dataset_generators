@@ -66,6 +66,7 @@ DEFAULT_COMMENT2: str = ''
 
 EXCLUDE_COMMENT:    bool = False
 NSP_CDATE_AS_DDATE: bool = False
+KEEP_FOLDERS:       bool = False
 NUM_THREADS:        int  = MAX_CPU_THREAD_COUNT
 
 HACTOOLNET_VERSION_REGEX           = re.compile(r'^hactoolnet\s+v?(.+?)$', flags=(re.MULTILINE | re.IGNORECASE))
@@ -778,6 +779,9 @@ class NspInfo:
         # Parse hactoolnet JSON report.
         self._parse_hactoolnet_json_report(json_report)
 
+        # Optionally extract NSP contents to a persistent folder.
+        self._extract_to_folder()
+
         # Perform cleanup.
         self._cleanup()
 
@@ -920,6 +924,26 @@ class NspInfo:
 
         # Update flag.
         self._cleanup_called = True
+
+    def _extract_to_folder(self) -> None:
+        if not KEEP_FOLDERS:
+            return
+
+        base_name = os.path.splitext(os.path.basename(self._orig_nsp_path))[0]
+        extract_dir = os.path.join(OUTPUT_PATH, f'{base_name}_files')
+        os.makedirs(extract_dir, exist_ok=True)
+
+        print(f'(Thread {self._thrd_id}) Extracting NSP contents to "{extract_dir}"...', flush=True)
+
+        proc = utilsRunHactoolnet('nsp', ['--outdir', extract_dir, self._nsp_path])
+        extracted_count = len(glob.glob(os.path.join(glob.escape(extract_dir), '*')))
+
+        if (proc.returncode != 0) or (extracted_count <= 0):
+            hactoolnet_stderr = proc.stderr.strip()
+            raise self.Exception(
+                f'(Thread {self._thrd_id}) Failed to extract NSP contents'
+                f'{f" ({hactoolnet_stderr})" if hactoolnet_stderr else ""}.'
+            )
 
     def __exit__(self) -> None:
         #print('nsp: __exit__ called', flush=True)
@@ -1324,7 +1348,7 @@ def utilsValidateThreadCount(num_threads: str) -> int:
 def main() -> int:
     global NSP_PATH, HACTOOLNET_PATH, KEYS_PATH, OUTPUT_PATH, EXCLUDE_NSP, EXCLUDE_TIK
     global DEFAULT_SECTION, DDATE_PROVIDED, DEFAULT_DDATE, RDATE_PROVIDED, DEFAULT_RDATE, DEFAULT_DUMPER, DEFAULT_PROJECT, DEFAULT_TOOL, DEFAULT_REGION
-    global EXCLUDE_COMMENT, NSP_CDATE_AS_DDATE, NUM_THREADS
+    global EXCLUDE_COMMENT, NSP_CDATE_AS_DDATE, KEEP_FOLDERS, NUM_THREADS
 
     # Get git commit information.
     utilsGetGitRepositoryInfo()
@@ -1351,6 +1375,7 @@ def main() -> int:
 
     parser.add_argument('--exclude-comment', action='store_true', default=EXCLUDE_COMMENT, help='Excludes information about this script from the comment2 field in XML entries. Disabled by default (comment2 fields hold information about this script).')
     parser.add_argument('--nsp-cdate-as-ddate', action='store_true', default=NSP_CDATE_AS_DDATE, help='Uses NSP file date information as the dump date. Disabled by default (current date is used for all files if no date is explicitly provided).')
+    parser.add_argument('--keep-folders', action='store_true', default=KEEP_FOLDERS, help='Keeps extracted NSP contents as separate folders in the output directory (useful for CDN/grinder workflows). Disabled by default.')
     parser.add_argument('--num-threads', type=utilsValidateThreadCount, metavar='VALUE', default=NUM_THREADS, help=f'Sets the number of threads used to process input NSP/NSZ files. Defaults to {NUM_THREADS} if not provided. This value must not be exceeded.')
 
     print(f'{SCRIPT_NAME}.\nRevision: {GIT_REV}.\nMade by DarkMatterCore.\n', flush=True)
@@ -1377,6 +1402,7 @@ def main() -> int:
 
     EXCLUDE_COMMENT = args.exclude_comment
     NSP_CDATE_AS_DDATE = args.nsp_cdate_as_ddate
+    KEEP_FOLDERS = args.keep_folders
     NUM_THREADS = args.num_threads
 
     # Get hactoolnet version.
